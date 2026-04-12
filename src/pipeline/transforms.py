@@ -33,20 +33,29 @@ def join_claims_patients(claims_df: DataFrame, patients_df: DataFrame) -> DataFr
       - Spark will auto-broadcast tables under 10MB, but we use an explicit
         hint to make the intent clear and guarantee the optimization
 
+    In production, patient demographics in the dimension table may be more
+    current than the denormalized demographics on each claim row. We join
+    to ensure we use the latest patient state from the source-of-truth table.
+
     # Databricks equivalent: same syntax — broadcast hints work identically
     """
-    # Use broadcast hint on the smaller table to avoid shuffle join
-    joined_df = claims_df.join(
-        F.broadcast(patients_df.select("patient_id", "comorbidity_count")),
+    # Columns that exist in both tables (besides the join key)
+    patient_demographic_cols = [
+        c for c in patients_df.columns if c != "patient_id"
+    ]
+
+    # Drop patient demographics from claims so the join brings in the
+    # authoritative version from the patients dimension table
+    claims_normalized = claims_df.drop(*patient_demographic_cols)
+
+    # Broadcast the small dimension table to avoid shuffling the large fact table
+    joined_df = claims_normalized.join(
+        F.broadcast(patients_df),
         on="patient_id",
         how="left",
     )
-    # Drop duplicate comorbidity_count from patients (already in claims)
-    # Keep the claims version since it's already there
-    if "comorbidity_count" in [f.name for f in joined_df.schema.fields]:
-        pass  # Already present from claims data
 
-    return claims_df  # Claims already has all patient fields from data generation
+    return joined_df
 
 
 # ──────────────────────────────────────────────

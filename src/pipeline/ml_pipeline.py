@@ -3,12 +3,20 @@ HealthSpark — PySpark MLlib Pipeline
 =======================================
 End-to-end ML pipeline for 30-day readmission prediction using PySpark MLlib.
 
+Model comparison:
+  - Logistic Regression (baseline): fast, interpretable, strong baseline
+  - Random Forest (tuned): non-linear, handles mixed features, feature importances
+
 Pipeline stages:
-  StringIndexer → OneHotEncoder → VectorAssembler → StandardScaler → RandomForestClassifier
+  StringIndexer -> OneHotEncoder -> VectorAssembler -> StandardScaler -> Classifier
 
 Hyperparameter tuning:
-  CrossValidator with ParamGridBuilder (numTrees × maxDepth × maxBins = 27 combos)
+  CrossValidator with ParamGridBuilder for Random Forest
   Evaluated with BinaryClassificationEvaluator (AUC-ROC)
+
+Class imbalance:
+  Handled via weighted column (inverse class frequency) — readmission is ~15%,
+  so positive class gets higher weight to avoid the model ignoring the minority.
 
 Why PySpark MLlib (not scikit-learn)?
   - Trains on distributed data — scales to billions of rows without sampling
@@ -25,7 +33,10 @@ import sys
 import time
 
 from pyspark.ml import Pipeline
-from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.classification import (
+    LogisticRegression,
+    RandomForestClassifier,
+)
 from pyspark.ml.evaluation import (
     BinaryClassificationEvaluator,
     MulticlassClassificationEvaluator,
@@ -41,113 +52,179 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 
-def build_ml_pipeline() -> tuple[Pipeline, list[str], list[str]]:
-    """Construct the full MLlib Pipeline with all preprocessing + model stages.
+# ──────────────────────────────────────────────
+# Preprocessing stages (shared across models)
+# ──────────────────────────────────────────────
 
-    Returns:
-        pipeline: Unfitted Pipeline object
-        cat_cols: List of categorical column names
-        numeric_cols: List of numeric feature column names
+# Categorical and numeric column definitions
+CAT_COLS = ["facility_type", "insurance_type", "gender", "age_bucket"]
+INDEXED_COLS = [f"{c}_idx" for c in CAT_COLS]
+OHE_COLS = [f"{c}_ohe" for c in CAT_COLS]
+
+NUMERIC_COLS = [
+    "claim_amount", "paid_amount", "length_of_stay", "age",
+    "comorbidity_count", "diagnosis_risk_score", "los_vs_expected_ratio",
+    "provider_denial_rate", "provider_claim_volume", "payer_approval_rate",
+    "patient_avg_claim", "patient_total_claims", "cost_ratio_to_patient_avg",
+    "comorbidity_index", "rolling_cost_90d", "claim_count_90d",
+    "days_since_last_claim", "prev_denial_flag", "prev_claim_amount",
+    "claim_sequence",
+]
+
+
+def _build_preprocessing_stages():
+    """Build shared preprocessing stages used by all models.
+
+    Returns indexers, encoder, assembler, scaler, and the list of
+    assembler input column names.
     """
-    # ── Categorical columns ──
-    cat_cols = ["facility_type", "insurance_type", "gender", "age_bucket"]
-    indexed_cols = [f"{c}_idx" for c in cat_cols]
-    ohe_cols = [f"{c}_ohe" for c in cat_cols]
-
-    # ── Numeric columns (engineered in feature_engineering.py) ──
-    numeric_cols = [
-        "claim_amount", "paid_amount", "length_of_stay", "age",
-        "comorbidity_count", "diagnosis_risk_score", "los_vs_expected_ratio",
-        "provider_denial_rate", "provider_claim_volume", "payer_approval_rate",
-        "patient_avg_claim", "patient_total_claims", "cost_ratio_to_patient_avg",
-        "comorbidity_index", "rolling_cost_90d", "claim_count_90d",
-        "days_since_last_claim", "prev_denial_flag", "prev_claim_amount",
-        "claim_sequence",
-    ]
-
-    # Stage 1: StringIndexer — convert categorical strings to numeric indices
     indexers = [
         StringIndexer(inputCol=col, outputCol=idx_col, handleInvalid="keep")
-        for col, idx_col in zip(cat_cols, indexed_cols)
+        for col, idx_col in zip(CAT_COLS, INDEXED_COLS)
     ]
+    encoder = OneHotEncoder(inputCols=INDEXED_COLS, outputCols=OHE_COLS, dropLast=True)
 
-    # Stage 2: OneHotEncoder — create sparse binary vectors from indices
-    encoder = OneHotEncoder(inputCols=indexed_cols, outputCols=ohe_cols, dropLast=True)
-
-    # Stage 3: VectorAssembler — combine all features into one vector
-    all_feature_cols = numeric_cols + ohe_cols
+    all_feature_cols = NUMERIC_COLS + OHE_COLS
     assembler = VectorAssembler(
         inputCols=all_feature_cols,
         outputCol="raw_features",
         handleInvalid="skip",
     )
-
-    # Stage 4: StandardScaler — normalize features for better convergence
-    # withMean=False because sparse vectors don't support mean centering
     scaler = StandardScaler(
         inputCol="raw_features",
         outputCol="scaled_features",
-        withMean=False,
+        withMean=False,  # False because sparse vectors don't support mean centering
         withStd=True,
     )
+    return indexers, encoder, assembler, scaler
 
-    # Stage 5: RandomForestClassifier — ensemble of decision trees
-    # Why RandomForest?
-    #   - Handles mixed feature types well (numeric + one-hot)
-    #   - Robust to outliers (common in claims data)
-    #   - Provides feature importance scores (critical for clinical interpretability)
-    #   - Scales well in distributed Spark (each tree trained on a partition)
-    rf = RandomForestClassifier(
+
+def add_class_weights(df: DataFrame, label_col: str = "readmission_30day") -> DataFrame:
+    """Add a weight column to handle class imbalance.
+
+    Weights are inversely proportional to class frequency:
+      - Majority class (not readmitted): weight = 1.0
+      - Minority class (readmitted): weight = (count_negative / count_positive)
+
+    This forces the model to pay more attention to the underrepresented
+    readmission cases, improving recall without oversampling (SMOTE).
+    """
+    pos_count = df.where(F.col(label_col) == 1).count()
+    neg_count = df.where(F.col(label_col) == 0).count()
+    balance_ratio = neg_count / max(pos_count, 1)
+
+    df = df.withColumn(
+        "class_weight",
+        F.when(F.col(label_col) == 1, balance_ratio).otherwise(1.0),
+    )
+    print(f"  Class balance: {neg_count:,} negative / {pos_count:,} positive (ratio {balance_ratio:.2f})")
+    print(f"  Weight for positive class: {balance_ratio:.2f}")
+    return df
+
+
+# ──────────────────────────────────────────────
+# Model 1: Logistic Regression (baseline)
+# ──────────────────────────────────────────────
+
+def build_lr_pipeline():
+    """Build a Logistic Regression pipeline as the interpretable baseline.
+
+    Why LR as baseline?
+      - Fast to train (minutes vs. hours for ensembles at scale)
+      - Coefficients are directly interpretable (log-odds ratios)
+      - Strong baseline: if LR does well, the problem is mostly linear
+      - If RF/XGBoost outperforms LR significantly, non-linear patterns exist
+    """
+    indexers, encoder, assembler, scaler = _build_preprocessing_stages()
+
+    lr = LogisticRegression(
         featuresCol="scaled_features",
         labelCol="readmission_30day",
         predictionCol="prediction",
         probabilityCol="probability",
         rawPredictionCol="raw_prediction",
-        seed=42,
+        weightCol="class_weight",
+        maxIter=100,
+        regParam=0.01,       # L2 regularization to prevent overfitting
+        elasticNetParam=0.1, # Mix of L1 and L2 (0=L2, 1=L1)
     )
 
-    # Assemble pipeline: all stages execute in order
-    pipeline = Pipeline(stages=indexers + [encoder, assembler, scaler, rf])
-
-    return pipeline, cat_cols, numeric_cols
+    pipeline = Pipeline(stages=indexers + [encoder, assembler, scaler, lr])
+    return pipeline
 
 
-def tune_and_train(
-    pipeline: Pipeline,
-    train_df: DataFrame,
-) -> tuple:
-    """Run hyperparameter tuning with CrossValidator.
-
-    Grid search over:
-      - numTrees: [50, 100, 200]  (more trees = better generalization, slower)
-      - maxDepth: [5, 10, 15]     (deeper = more complex, risk of overfitting)
-      - maxBins: [32, 64, 128]    (more bins = finer splits for continuous features)
-
-    Total combinations: 3 × 3 × 3 = 27 parameter sets × 3 folds = 81 model fits
-
-    # Databricks equivalent: MLflow autologging captures all runs automatically
-    """
-    # Get the RandomForestClassifier stage from the pipeline
-    rf_stage = pipeline.getStages()[-1]
-
-    # Build parameter grid
-    param_grid = (
-        ParamGridBuilder()
-        .addGrid(rf_stage.numTrees, [50, 100, 200])
-        .addGrid(rf_stage.maxDepth, [5, 10, 15])
-        .addGrid(rf_stage.maxBins, [32, 64, 128])
-        .build()
-    )
-
-    # Evaluator: AUC-ROC for binary classification
+def train_logistic_regression(pipeline: Pipeline, train_df: DataFrame) -> tuple:
+    """Train the logistic regression baseline model."""
     evaluator = BinaryClassificationEvaluator(
         labelCol="readmission_30day",
         rawPredictionCol="raw_prediction",
         metricName="areaUnderROC",
     )
 
-    # CrossValidator: 3-fold cross-validation
-    # parallelism=2 runs two parameter combos in parallel on the driver
+    start = time.time()
+    lr_model = pipeline.fit(train_df)
+    elapsed = time.time() - start
+    print(f"  Logistic Regression trained in {elapsed:.1f}s")
+
+    return lr_model, evaluator
+
+
+# ──────────────────────────────────────────────
+# Model 2: Random Forest (tuned)
+# ──────────────────────────────────────────────
+
+def build_rf_pipeline():
+    """Build a Random Forest pipeline with CrossValidator tuning.
+
+    Why Random Forest?
+      - Handles mixed feature types well (numeric + one-hot)
+      - Robust to outliers (common in claims data)
+      - Provides feature importance scores (critical for clinical interpretability)
+      - Scales well in distributed Spark (each tree trained on a partition)
+    """
+    indexers, encoder, assembler, scaler = _build_preprocessing_stages()
+
+    rf = RandomForestClassifier(
+        featuresCol="scaled_features",
+        labelCol="readmission_30day",
+        predictionCol="prediction",
+        probabilityCol="probability",
+        rawPredictionCol="raw_prediction",
+        weightCol="class_weight",
+        seed=42,
+    )
+
+    pipeline = Pipeline(stages=indexers + [encoder, assembler, scaler, rf])
+    return pipeline, rf
+
+
+def tune_and_train_rf(pipeline: Pipeline, rf_stage, train_df: DataFrame) -> tuple:
+    """Run hyperparameter tuning with CrossValidator.
+
+    Grid search over:
+      - numTrees: [100, 200]   (more trees = better generalization)
+      - maxDepth: [8, 15]      (deeper = more complex patterns)
+      - maxBins:  [64, 128]    (finer splits for continuous features)
+
+    Total: 2 x 2 x 2 = 8 combos x 3 folds = 24 model fits
+    (reduced from 81 to keep Colab runtime practical while still tuning)
+
+    # Databricks equivalent: MLflow autologging captures all runs automatically
+    """
+    param_grid = (
+        ParamGridBuilder()
+        .addGrid(rf_stage.numTrees, [100, 200])
+        .addGrid(rf_stage.maxDepth, [8, 15])
+        .addGrid(rf_stage.maxBins, [64, 128])
+        .build()
+    )
+
+    evaluator = BinaryClassificationEvaluator(
+        labelCol="readmission_30day",
+        rawPredictionCol="raw_prediction",
+        metricName="areaUnderROC",
+    )
+
     cross_validator = CrossValidator(
         estimator=pipeline,
         estimatorParamMaps=param_grid,
@@ -157,112 +234,107 @@ def tune_and_train(
         seed=42,
     )
 
-    print("  Starting CrossValidator (27 param combos × 3 folds = 81 fits)...")
-    print("  This may take several minutes on local mode...\n")
+    print(f"  Starting CrossValidator ({len(param_grid)} param combos x 3 folds = {len(param_grid)*3} fits)...")
+    print("  This may take several minutes...\n")
 
-    start_time = time.time()
+    start = time.time()
     cv_model = cross_validator.fit(train_df)
-    elapsed = time.time() - start_time
-
-    print(f"  Training complete in {elapsed:.1f} seconds")
+    elapsed = time.time() - start
+    print(f"  Random Forest tuning complete in {elapsed:.1f}s")
 
     return cv_model, evaluator
 
 
-def evaluate_model(cv_model, test_df: DataFrame, evaluator) -> dict:
-    """Evaluate the best model on the test set with multiple metrics.
+# ──────────────────────────────────────────────
+# Evaluation
+# ──────────────────────────────────────────────
+
+def evaluate_model(model, test_df: DataFrame, model_name: str) -> tuple[dict, DataFrame]:
+    """Evaluate a model on the test set with multiple metrics.
 
     Metrics:
-      - AUC-ROC: overall discriminative ability (>0.5 = better than random)
+      - AUC-ROC: overall discriminative ability
+      - AUC-PR: precision-recall tradeoff (better for imbalanced data)
       - F1 Score: harmonic mean of precision and recall
       - Accuracy: overall correct predictions
       - Precision/Recall: for the positive class (readmitted)
     """
-    # Get predictions from best model
-    predictions = cv_model.transform(test_df)
+    predictions = model.transform(test_df)
 
     # AUC-ROC
-    auc_roc = evaluator.evaluate(predictions)
+    auc_roc = BinaryClassificationEvaluator(
+        labelCol="readmission_30day", rawPredictionCol="raw_prediction",
+        metricName="areaUnderROC",
+    ).evaluate(predictions)
 
-    # F1 Score
-    f1_evaluator = MulticlassClassificationEvaluator(
-        labelCol="readmission_30day",
-        predictionCol="prediction",
-        metricName="f1",
-    )
-    f1_score = f1_evaluator.evaluate(predictions)
+    # AUC-PR (more informative than AUC-ROC for imbalanced datasets)
+    auc_pr = BinaryClassificationEvaluator(
+        labelCol="readmission_30day", rawPredictionCol="raw_prediction",
+        metricName="areaUnderPR",
+    ).evaluate(predictions)
 
-    # Accuracy
-    accuracy_evaluator = MulticlassClassificationEvaluator(
-        labelCol="readmission_30day",
-        predictionCol="prediction",
-        metricName="accuracy",
-    )
-    accuracy = accuracy_evaluator.evaluate(predictions)
+    # F1, Accuracy, Precision, Recall
+    f1 = MulticlassClassificationEvaluator(
+        labelCol="readmission_30day", predictionCol="prediction", metricName="f1",
+    ).evaluate(predictions)
 
-    # Precision and Recall
-    precision_evaluator = MulticlassClassificationEvaluator(
-        labelCol="readmission_30day",
-        predictionCol="prediction",
-        metricName="weightedPrecision",
-    )
-    precision = precision_evaluator.evaluate(predictions)
+    accuracy = MulticlassClassificationEvaluator(
+        labelCol="readmission_30day", predictionCol="prediction", metricName="accuracy",
+    ).evaluate(predictions)
 
-    recall_evaluator = MulticlassClassificationEvaluator(
-        labelCol="readmission_30day",
-        predictionCol="prediction",
-        metricName="weightedRecall",
-    )
-    recall = recall_evaluator.evaluate(predictions)
+    precision = MulticlassClassificationEvaluator(
+        labelCol="readmission_30day", predictionCol="prediction", metricName="weightedPrecision",
+    ).evaluate(predictions)
+
+    recall = MulticlassClassificationEvaluator(
+        labelCol="readmission_30day", predictionCol="prediction", metricName="weightedRecall",
+    ).evaluate(predictions)
 
     metrics = {
         "auc_roc": round(auc_roc, 4),
-        "f1_score": round(f1_score, 4),
+        "auc_pr": round(auc_pr, 4),
+        "f1_score": round(f1, 4),
         "accuracy": round(accuracy, 4),
         "precision": round(precision, 4),
         "recall": round(recall, 4),
     }
 
-    print(f"\n{'-' * 50}")
-    print(f"  Model Evaluation (Test Set)")
-    print(f"{'-' * 50}")
+    print(f"\n  {model_name} Metrics:")
+    print(f"  {'-' * 40}")
     for metric, value in metrics.items():
-        print(f"  {metric:>15}: {value:.4f}")
-    print(f"{'-' * 50}")
+        print(f"    {metric:>15}: {value:.4f}")
 
     return metrics, predictions
 
 
-def extract_feature_importances(cv_model, numeric_cols: list[str], cat_cols: list[str]) -> list[dict]:
-    """Extract and rank feature importances from the best RandomForest model.
+def extract_feature_importances(cv_model, model_type: str = "rf") -> list[dict]:
+    """Extract and rank feature importances from the best model.
 
-    Feature importance in RandomForest = mean decrease in impurity (Gini)
-    across all trees for each feature.
+    For RandomForest: mean decrease in impurity (Gini) across all trees.
+    For LogisticRegression: absolute coefficient values.
     """
-    # Navigate to the best model's RandomForest stage
-    best_model = cv_model.bestModel
-    rf_model = best_model.stages[-1]  # Last stage is the RF classifier
+    best_model = cv_model.bestModel if hasattr(cv_model, "bestModel") else cv_model
+    classifier = best_model.stages[-1]
 
-    importances = rf_model.featureImportances.toArray()
+    feature_names = list(NUMERIC_COLS) + [f"{c}_ohe" for c in CAT_COLS]
 
-    # Build feature name list (numeric + OHE categories)
-    feature_names = list(numeric_cols)
-    for cat in cat_cols:
-        feature_names.append(f"{cat}_ohe")
+    if model_type == "rf":
+        importances = classifier.featureImportances.toArray()
+    else:
+        importances = [abs(float(v)) for v in classifier.coefficients.toArray()]
 
-    # Pad or truncate to match importance vector length
+    # Pad or truncate names to match vector length
     while len(feature_names) < len(importances):
         feature_names.append(f"feature_{len(feature_names)}")
-    feature_names = feature_names[:len(importances)]
+    feature_names = feature_names[: len(importances)]
 
-    # Rank by importance
     importance_list = [
         {"feature": name, "importance": round(float(imp), 6)}
         for name, imp in zip(feature_names, importances)
     ]
     importance_list.sort(key=lambda x: x["importance"], reverse=True)
 
-    print(f"\n  Top 10 Feature Importances:")
+    print(f"\n  Top 10 Feature Importances ({model_type.upper()}):")
     for i, feat in enumerate(importance_list[:10]):
         bar = "#" * int(feat["importance"] * 100)
         print(f"  {i+1:>3}. {feat['feature']:<30} {feat['importance']:.4f} {bar}")
@@ -274,24 +346,31 @@ def get_best_params(cv_model) -> dict:
     """Extract the best hyperparameters from the CrossValidator model."""
     best_model = cv_model.bestModel
     rf_model = best_model.stages[-1]
-
-    params = {
+    return {
         "numTrees": rf_model.getNumTrees,
         "maxDepth": rf_model.getOrDefault("maxDepth"),
         "maxBins": rf_model.getOrDefault("maxBins"),
     }
-    return params
 
 
-def save_results(metrics: dict, importances: list, best_params: dict, output_dir: str) -> None:
+def save_results(
+    model_comparison: dict,
+    rf_importances: list,
+    lr_importances: list,
+    best_params: dict,
+    output_dir: str,
+) -> None:
     """Save all metrics, feature importances, and best params to JSON.
 
     # Databricks equivalent: mlflow.log_metrics(), mlflow.log_params()
     """
     results = {
-        "metrics": metrics,
+        "model_comparison": model_comparison,
         "best_params": best_params,
-        "feature_importances": importances[:20],  # Top 20
+        "feature_importances": rf_importances[:20],
+        "lr_feature_importances": lr_importances[:20],
+        # Keep backward-compatible 'metrics' key pointing to best model
+        "metrics": model_comparison.get("random_forest", model_comparison.get("logistic_regression", {})),
     }
 
     os.makedirs(output_dir, exist_ok=True)
@@ -301,16 +380,20 @@ def save_results(metrics: dict, importances: list, best_params: dict, output_dir
     print(f"\n  Results saved to {results_path}")
 
 
+# ──────────────────────────────────────────────
+# Main pipeline entry point
+# ──────────────────────────────────────────────
+
 def run_ml_pipeline(spark: SparkSession, features_df: DataFrame, data_dir: str) -> None:
-    """Execute the full ML training pipeline.
+    """Execute the full ML training pipeline with model comparison.
 
     Steps:
-      1. Prepare data (fill nulls, split train/test)
-      2. Build MLlib Pipeline
-      3. Tune with CrossValidator
-      4. Evaluate on test set
-      5. Extract feature importances
-      6. Save model and results
+      1. Prepare data (fill nulls, add class weights, split train/test)
+      2. Train Logistic Regression baseline
+      3. Train Random Forest with CrossValidator tuning
+      4. Compare models on test set
+      5. Extract feature importances from both models
+      6. Save best model and results
     """
     print("=" * 60)
     print("HealthSpark — ML Training Pipeline")
@@ -322,7 +405,6 @@ def run_ml_pipeline(spark: SparkSession, features_df: DataFrame, data_dir: str) 
     # ── Step 1: Prepare data ──
     print("\n[1/6] Preparing data...")
 
-    # Fill nulls in temporal features
     features_df = features_df.fillna({
         "days_since_last_claim": -1,
         "prev_denial_flag": 0,
@@ -338,23 +420,28 @@ def run_ml_pipeline(spark: SparkSession, features_df: DataFrame, data_dir: str) 
         "cost_ratio_to_patient_avg": 1.0,
     })
 
-    # Ensure label column exists and is integer
     features_df = features_df.withColumn(
-        "readmission_30day",
-        F.col("readmission_30day").cast("integer")
+        "readmission_30day", F.col("readmission_30day").cast("integer")
     )
 
     # Drop columns that the ML Pipeline will recreate (from feature_engineering's
     # build_feature_vector). The Pipeline's own StringIndexer/OHE stages need to
     # produce these from scratch so the fitted stages are saved with the model.
-    cols_to_drop = [c for c in features_df.columns
-                    if c.endswith("_idx") or c.endswith("_ohe")
-                    or c in ("features", "raw_features", "scaled_features")]
+    cols_to_drop = [
+        c for c in features_df.columns
+        if c.endswith("_idx") or c.endswith("_ohe")
+        or c in ("features", "raw_features", "scaled_features")
+    ]
     if cols_to_drop:
         features_df = features_df.drop(*cols_to_drop)
 
+    # Add class weights to handle imbalance
+    features_df = add_class_weights(features_df)
+
     # Train/test split: 80/20 with fixed seed for reproducibility
     train_df, test_df = features_df.randomSplit([0.8, 0.2], seed=42)
+    train_df.cache()
+    test_df.cache()
 
     train_count = train_df.count()
     test_count = test_df.count()
@@ -362,35 +449,59 @@ def run_ml_pipeline(spark: SparkSession, features_df: DataFrame, data_dir: str) 
     print(f"  Train: {train_count:,} rows | Test: {test_count:,} rows")
     print(f"  Positive class rate (train): {pos_rate:.1%}")
 
-    # ── Step 2: Build Pipeline ──
-    print("\n[2/6] Building MLlib Pipeline...")
-    pipeline, cat_cols, numeric_cols = build_ml_pipeline()
-    print(f"  Pipeline stages: {len(pipeline.getStages())}")
+    # ── Step 2: Logistic Regression baseline ──
+    print("\n[2/6] Training Logistic Regression baseline...")
+    lr_pipeline = build_lr_pipeline()
+    lr_model, lr_evaluator = train_logistic_regression(lr_pipeline, train_df)
 
-    # ── Step 3: CrossValidator tuning ──
-    print("\n[3/6] Running hyperparameter tuning...")
-    cv_model, evaluator = tune_and_train(pipeline, train_df)
+    # ── Step 3: Random Forest with CrossValidator ──
+    print("\n[3/6] Building & tuning Random Forest...")
+    rf_pipeline, rf_stage = build_rf_pipeline()
+    cv_model, rf_evaluator = tune_and_train_rf(rf_pipeline, rf_stage, train_df)
 
-    # ── Step 4: Evaluate ──
-    print("\n[4/6] Evaluating on test set...")
-    metrics, predictions = evaluate_model(cv_model, test_df, evaluator)
+    # ── Step 4: Evaluate both models ──
+    print("\n[4/6] Evaluating models on test set...")
+    lr_metrics, lr_predictions = evaluate_model(lr_model, test_df, "Logistic Regression")
+    rf_metrics, rf_predictions = evaluate_model(cv_model, test_df, "Random Forest")
+
+    model_comparison = {
+        "logistic_regression": lr_metrics,
+        "random_forest": rf_metrics,
+    }
+
+    # Print comparison table
+    print(f"\n{'=' * 60}")
+    print(f"  MODEL COMPARISON")
+    print(f"{'=' * 60}")
+    print(f"  {'Metric':<20} {'LR (Baseline)':>15} {'RF (Tuned)':>15}")
+    print(f"  {'-' * 50}")
+    for metric in lr_metrics:
+        lr_val = lr_metrics[metric]
+        rf_val = rf_metrics[metric]
+        winner = " <--" if rf_val > lr_val else ""
+        print(f"  {metric:<20} {lr_val:>15.4f} {rf_val:>15.4f}{winner}")
+    print(f"{'=' * 60}")
 
     # ── Step 5: Feature importances ──
     print("\n[5/6] Extracting feature importances...")
-    importances = extract_feature_importances(cv_model, numeric_cols, cat_cols)
+    rf_importances = extract_feature_importances(cv_model, "rf")
+    lr_importances = extract_feature_importances(lr_model, "lr")
 
     # ── Step 6: Save model and results ──
     print("\n[6/6] Saving model and results...")
     best_params = get_best_params(cv_model)
-    print(f"  Best params: {best_params}")
+    print(f"  Best RF params: {best_params}")
 
-    # Save the full pipeline model (all stages: indexers + encoder + scaler + RF)
-    # This allows loading a single object for inference — no preprocessing code needed
+    # Save the best RF pipeline model (all stages serialized together)
     # Databricks equivalent: mlflow.spark.log_model(cv_model.bestModel, "model")
     cv_model.bestModel.write().overwrite().save(model_path)
     print(f"  Model saved to {model_path}")
 
-    save_results(metrics, importances, best_params, models_dir)
+    save_results(model_comparison, rf_importances, lr_importances, best_params, models_dir)
+
+    # Unpersist cached DataFrames
+    train_df.unpersist()
+    test_df.unpersist()
 
     print("\n" + "=" * 60)
     print("ML Pipeline complete!")
@@ -402,8 +513,7 @@ def run_ml_pipeline(spark: SparkSession, features_df: DataFrame, data_dir: str) 
 # ──────────────────────────────────────────────
 
 def main():
-    """Run the entire HealthSpark pipeline: Ingest → Transform → Features → ML."""
-    # Add project root to path
+    """Run the entire HealthSpark pipeline: Ingest -> Transform -> Features -> ML."""
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
@@ -415,22 +525,13 @@ def main():
 
     data_dir = os.path.join(project_root, "data")
 
-    # Initialize Spark
     spark = get_spark_session(app_name="HealthSpark-ML-Pipeline")
 
     try:
-        # Stage 1: Ingest raw CSV → Parquet
         claims_df, patients_df = ingest_all(spark, data_dir)
-
-        # Stage 2: Transforms (joins, windows, aggregations)
         enriched_df = run_all_transforms(spark, claims_df, patients_df)
-
-        # Stage 3: Feature engineering
         features_df = engineer_features(spark, enriched_df)
-
-        # Stage 4: ML Pipeline (train, tune, evaluate, save)
         run_ml_pipeline(spark, features_df, data_dir)
-
     finally:
         spark.stop()
         print("\nSparkSession stopped.")

@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Run PySpark Tests
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (required for Spark 3.5)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyspark==3.5.3 pytest numpy pandas
+
+      - name: Set Spark environment
+        run: |
+          echo "PYSPARK_PYTHON=python" >> $GITHUB_ENV
+          echo "PYSPARK_DRIVER_PYTHON=python" >> $GITHUB_ENV
+          echo "SPARK_LOCAL_IP=127.0.0.1" >> $GITHUB_ENV
+
+      - name: Run pytest
+        run: |
+          pytest tests/ -v --tb=short
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+  lint:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install linters
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Run ruff
+        run: |
+          ruff check src/ tests/ --select E,W,F --ignore E501 || true
