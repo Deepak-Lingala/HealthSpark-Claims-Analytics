@@ -27,6 +27,7 @@ def get_spark_session(
     master: str = "local[*]",
     shuffle_partitions: int = 8,
     enable_hive: bool = False,
+    driver_memory: str = "8g",
 ) -> SparkSession:
     """Create or retrieve a SparkSession with production-tuned defaults.
 
@@ -53,12 +54,22 @@ def get_spark_session(
         .config("spark.sql.autoBroadcastJoinThreshold", "10485760")  # 10MB
         # Arrow optimization for toPandas() — critical for notebook plotting
         .config("spark.sql.execution.arrow.pyspark.enabled", "true")
-        # Limit driver memory for local mode (increase on cluster)
-        .config("spark.driver.memory", "4g")
-        # Windows: tell the JVM where to find hadoop.dll for native IO
-        .config("spark.driver.extraJavaOptions",
-                f"-Djava.library.path=C:/hadoop/bin -Dhadoop.home.dir=C:/hadoop")
+        # Driver memory — 8g default fits Colab Pro (~25GB); RF tree builder
+        # collects per-node histograms to the driver and OOMs at 4g on 500k rows
+        .config("spark.driver.memory", driver_memory)
+        # Guard against large collect() results (feature importances, CV metrics)
+        .config("spark.driver.maxResultSize", "2g")
+        # Keep per-task memory bounded so shuffle spills to disk instead of OOMing
+        .config("spark.memory.fraction", "0.8")
     )
+
+    # Windows-only: tell the JVM where to find hadoop.dll for native IO.
+    # On Linux/Colab, hadoop native libs aren't needed and the path would be invalid.
+    if os.name == "nt":
+        builder = builder.config(
+            "spark.driver.extraJavaOptions",
+            "-Djava.library.path=C:/hadoop/bin -Dhadoop.home.dir=C:/hadoop",
+        )
 
     if enable_hive:
         builder = builder.enableHiveSupport()

@@ -202,20 +202,25 @@ def tune_and_train_rf(pipeline: Pipeline, rf_stage, train_df: DataFrame) -> tupl
     """Run hyperparameter tuning with CrossValidator.
 
     Grid search over:
-      - numTrees: [100, 200]   (more trees = better generalization)
-      - maxDepth: [8, 15]      (deeper = more complex patterns)
-      - maxBins:  [64, 128]    (finer splits for continuous features)
+      - numTrees: [100, 150]   (more trees = better generalization)
+      - maxDepth: [8, 10]      (capped at 10 — deeper trees OOM the driver
+                                on local[*] when MLlib collects per-node
+                                histograms during split finding)
+      - maxBins:  [48]         (fixed at 48 — 64+ combined with deep trees
+                                and 500k rows kills the 8g driver)
 
-    Total: 2 x 2 x 2 = 8 combos x 3 folds = 24 model fits
-    (reduced from 81 to keep Colab runtime practical while still tuning)
+    Total: 2 x 2 x 1 = 4 combos x 3 folds = 12 model fits.
+    We deliberately keep RF lightweight here because the real production model
+    is the GPU XGBoost downstream (Step 5b) — RF serves as a distributed,
+    interpretable ensemble baseline.
 
     # Databricks equivalent: MLflow autologging captures all runs automatically
     """
     param_grid = (
         ParamGridBuilder()
-        .addGrid(rf_stage.numTrees, [100, 200])
-        .addGrid(rf_stage.maxDepth, [8, 15])
-        .addGrid(rf_stage.maxBins, [64, 128])
+        .addGrid(rf_stage.numTrees, [100, 150])
+        .addGrid(rf_stage.maxDepth, [8, 10])
+        .addGrid(rf_stage.maxBins, [48])
         .build()
     )
 
@@ -230,7 +235,10 @@ def tune_and_train_rf(pipeline: Pipeline, rf_stage, train_df: DataFrame) -> tupl
         estimatorParamMaps=param_grid,
         evaluator=evaluator,
         numFolds=3,
-        parallelism=2,
+        # parallelism=1: train folds sequentially. parallelism=2 doubles peak
+        # driver memory (two RFs building histograms at once) and was the root
+        # cause of the SparkContext shutdown on Colab.
+        parallelism=1,
         seed=42,
     )
 
