@@ -1,0 +1,36 @@
+# Data files (generated, not tracked)
+data/raw/
+data/processed/
+data/models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Spark
+derby.log
+metastore_db/
+spark-warehouse/
